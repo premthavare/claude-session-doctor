@@ -1,0 +1,1189 @@
+#!/usr/bin/env python3
+"""
+claude-session-doctor v1.1
+==========================
+Diagnose and repair corrupted Claude Code session history (.jsonl) files.
+
+v1.1 additions
+--------------
+* Recommendation engine: tells you what to do, not just what's wrong.
+* Preview-before-confirm: concrete change counts before any write.
+* --dry-run: preview the effect of any operation without touching disk.
+* --restore: roll back to the most recent backup in one step.
+* --json: machine-readable diagnosis for scripting/monitoring.
+* --fix-all: non-interactive batch repair with sensible exit codes.
+* Four new detectors:
+    - alternation_violation (critical, fixable)
+    - oversized_message (warning, advisory)
+    - empty_tool_result (warning, advisory)
+    - duplicate_consecutive (warning, fixable)
+    - misordered_timestamps (info, advisory)
+
+Out of scope: auth, rate limits, network 5xx, model availability. Those
+aren't session-file problems and require a different response.
+
+Usage:
+    claude-session-doctor                          # interactive
+    claude-session-doctor SESSION_ID               # interactive, this session
+    claude-session-doctor --list                   # quick listing
+    claude-session-doctor --json [SESSION_ID]      # machine-readable
+    claude-session-doctor --fix-all SESSION_ID     # non-interactive repair
+    claude-session-doctor --restore SESSION_ID     # roll back
+    claude-session-doctor ... --dry-run            # preview only
+    claude-session-doctor --dir PATH               # custom projects dir
+
+Exit codes:
+    0  clean / success
+    1  diagnosis found issues (with --json / --list / no fix applied)
+    2  fix applied but issues remain
+    3  user / input error (no such session, etc.)
+"""
+
+import argparse
+import copy
+import glob
+import hashlib
+import json
+import os
+import shutil
+import sys
+import textwrap
+import time
+
+# ---------------------------------------------------------------------------
+# Terminal colour
+# ---------------------------------------------------------------------------
+_USE_COLOR = (
+    (sys.stdout.isatty() or os.environ.get("FORCE_COLOR") == "1")
+    and "NO_COLOR" not in os.environ
+)
+
+
+def _c(code, s):
+    return f"\033[{code}m{s}\033[0m" if _USE_COLOR else s
+
+
+def bold(s):   return _c("1", s)
+def dim(s):    return _c("2", s)
+def red(s):    return _c("31", s)
+def green(s):  return _c("32", s)
+def yellow(s): return _c("33", s)
+def blue(s):   return _c("36", s)
+
+
+SEV_ORDER = {"critical": 0, "warning": 1, "info": 2}
+SEV_LABEL = {
+    "critical": red("CRITICAL"),
+    "warning": yellow("WARNING "),
+    "info": blue("INFO    "),
+}
+
+THINKING_TYPES = {"thinking", "redacted_thinking"}
+DEFAULT_DIR = os.path.expanduser("~/.claude/projects")
+LARGE_SESSION_LINES = 4000        # heuristic for oversized session
+LARGE_MESSAGE_BYTES = 200 * 1024  # heuristic for oversized single message
+DUPLICATE_MIN_TEXT_LEN = 50       # ignore trivial duplicates ("ok", "thanks")
+
+# Exit codes
+EXIT_OK = 0
+EXIT_ISSUES_FOUND = 1
+EXIT_ISSUES_REMAIN = 2
+EXIT_INPUT_ERROR = 3
+
+
+# ---------------------------------------------------------------------------
+# Record model
+# ---------------------------------------------------------------------------
+class Record:
+    __slots__ = ("raw", "obj", "new_obj", "deleted")
+
+    def __init__(self, raw, obj):
+        self.raw = raw
+        self.obj = obj
+        self.new_obj = None
+        self.deleted = False
+
+    def out_obj(self):
+        return self.new_obj if self.new_obj is not None else self.obj
+
+
+def load_records(path):
+    records = []
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.rstrip("\n")
+            if line.strip() == "":
+                records.append(Record(line, None))
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                obj = None
+            records.append(Record(line, obj))
+    return records
+
+
+def deep_copy_records(records):
+    """For dry-run / preview: independent record list to mutate freely."""
+    out = []
+    for r in records:
+        nr = Record(r.raw, copy.deepcopy(r.obj))
+        nr.new_obj = copy.deepcopy(r.new_obj)
+        nr.deleted = r.deleted
+        out.append(nr)
+    return out
+
+
+def write_records(path, records):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        for r in records:
+            if r.deleted:
+                continue
+            o = r.out_obj()
+            if o is None:
+                continue
+            f.write(json.dumps(o, ensure_ascii=False) + "\n")
+    os.replace(tmp, path)
+
+
+# ---------------------------------------------------------------------------
+# Parsing helpers
+# ---------------------------------------------------------------------------
+def rtype(rec):
+    o = rec.out_obj()
+    return o.get("type") if isinstance(o, dict) else None
+
+
+def message_of(rec):
+    o = rec.out_obj()
+    m = o.get("message") if isinstance(o, dict) else None
+    return m if isinstance(m, dict) else {}
+
+
+def content_of(rec):
+    c = message_of(rec).get("content")
+    return c if isinstance(c, list) else []
+
+
+def msg_id(rec):
+    return message_of(rec).get("id")
+
+
+def is_assistant(rec): return rtype(rec) == "assistant"
+def is_user(rec):      return rtype(rec) == "user"
+
+
+def has_thinking(rec):
+    return any(
+        isinstance(b, dict) and b.get("type") in THINKING_TYPES
+        for b in content_of(rec)
+    )
+
+
+def is_thinking_only(rec):
+    blocks = content_of(rec)
+    if not blocks:
+        return False
+    return all(
+        isinstance(b, dict) and b.get("type") in THINKING_TYPES for b in blocks
+    )
+
+
+def is_api_error(rec):
+    o = rec.out_obj()
+    if not isinstance(o, dict):
+        return False
+    if o.get("isApiErrorMessage") is True:
+        return True
+    for b in content_of(rec):
+        if isinstance(b, dict) and b.get("type") == "text":
+            t = (b.get("text") or "").lstrip()
+            if t.startswith("API Error") or t.startswith("Error: API Error"):
+                return True
+    return False
+
+
+def assistant_text(rec):
+    """Concatenated text content of an assistant message (for dup detection)."""
+    parts = []
+    for b in content_of(rec):
+        if isinstance(b, dict) and b.get("type") == "text":
+            parts.append(b.get("text") or "")
+    return "\n".join(parts)
+
+
+def record_size(rec):
+    o = rec.out_obj()
+    if o is None:
+        return len(rec.raw)
+    try:
+        return len(json.dumps(o, ensure_ascii=False))
+    except Exception:
+        return len(rec.raw)
+
+
+def record_timestamp(rec):
+    o = rec.out_obj()
+    if not isinstance(o, dict):
+        return None
+    ts = o.get("timestamp")
+    if isinstance(ts, (int, float)):
+        return float(ts)
+    if isinstance(ts, str):
+        # ISO-8601 best-effort parse using a fast path
+        try:
+            return time.mktime(time.strptime(ts[:19], "%Y-%m-%dT%H:%M:%S"))
+        except (ValueError, OverflowError):
+            return None
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Detectors. Each returns a list of issue dicts:
+#   {kind, severity, summary, lines}
+# ---------------------------------------------------------------------------
+def detect_invalid_json(records):
+    bad = [i + 1 for i, r in enumerate(records) if r.obj is None]
+    if not bad:
+        return []
+    return [{"kind": "invalid_json", "severity": "critical",
+            "summary": f"{len(bad)} unparseable / blank line(s) (truncated or partial writes)",
+            "lines": bad}]
+
+
+def detect_interleaved_thinking(records):
+    issues = []
+    n = len(records)
+    i = 0
+    while i < n:
+        if not is_assistant(records[i]):
+            i += 1
+            continue
+        j = i
+        run = []
+        while j < n and is_assistant(records[j]):
+            run.append(j)
+            j += 1
+        ids = {msg_id(records[k]) for k in run}
+        if len(ids) > 1 and any(has_thinking(records[k]) for k in run):
+            offenders = [k + 1 for k in run if is_thinking_only(records[k])]
+            if offenders:
+                issues.append({
+                    "kind": "interleaved_thinking", "severity": "critical",
+                    "summary": (f"interleaved thinking blocks across {len(ids)} "
+                                f"message IDs (lines {run[0]+1}-{run[-1]+1})"),
+                    "lines": offenders,
+                })
+        i = j
+    return issues
+
+
+def detect_empty_assistant(records):
+    bad = [i + 1 for i, r in enumerate(records)
+            if is_assistant(r) and len(content_of(r)) == 0]
+    if not bad:
+        return []
+    return [{"kind": "empty_assistant", "severity": "warning",
+            "summary": f"{len(bad)} assistant message(s) with empty content",
+            "lines": bad}]
+
+
+def _tool_use_ids(records):
+    ids = {}
+    for i, r in enumerate(records):
+        if not is_assistant(r) or r.deleted:
+            continue
+        for b in content_of(r):
+            if isinstance(b, dict) and b.get("type") == "tool_use":
+                ids[b.get("id")] = i
+    return ids
+
+
+def _tool_result_ids(records):
+    ids = {}
+    for i, r in enumerate(records):
+        if not is_user(r) or r.deleted:
+            continue
+        for b in content_of(r):
+            if isinstance(b, dict) and b.get("type") == "tool_result":
+                ids[b.get("tool_use_id")] = i
+    return ids
+
+
+def detect_tool_pairing(records):
+    issues = []
+    uses = _tool_use_ids(records)
+    results = _tool_result_ids(records)
+    orphan_uses = [u for u in uses if u not in results]
+    orphan_results = [r for r in results if r not in uses and r is not None]
+    if orphan_uses:
+        issues.append({
+            "kind": "orphan_tool_use", "severity": "critical",
+            "summary": f"{len(orphan_uses)} tool_use with no matching tool_result",
+            "lines": sorted(uses[u] + 1 for u in orphan_uses),
+        })
+    if orphan_results:
+        issues.append({
+            "kind": "orphan_tool_result", "severity": "warning",
+            "summary": f"{len(orphan_results)} tool_result with no matching tool_use",
+            "lines": sorted(results[r] + 1 for r in orphan_results),
+        })
+    return issues
+
+
+def detect_trailing_noise(records):
+    live = [i for i, r in enumerate(records) if not r.deleted]
+    bad = []
+    for i in reversed(live):
+        r = records[i]
+        t = rtype(r)
+        if t in ("user", "assistant") and not is_api_error(r):
+            break
+        bad.append(i + 1)
+    if not bad:
+        return []
+    return [{"kind": "trailing_noise", "severity": "warning",
+            "summary": f"{len(bad)} trailing error/noise line(s) at end of session",
+            "lines": sorted(bad)}]
+
+
+def detect_large_session(records):
+    live = sum(1 for r in records if not r.deleted)
+    if live < LARGE_SESSION_LINES:
+        return []
+    return [{"kind": "large_session", "severity": "info",
+            "summary": (f"{live} lines -- large session; interleaving and "
+                        f"auto-compact failures get more likely. Consider /compact."),
+            "lines": []}]
+
+
+def detect_alternation_violation(records):
+    """Two consecutive user records with no assistant turn between them.
+    (Assistant-assistant with different msg_ids is caught by interleaved.)"""
+    bad = []
+    prev_role = None
+    prev_idx = None
+    for i, r in enumerate(records):
+        if r.deleted:
+            continue
+        role = rtype(r)
+        if role not in ("user", "assistant"):
+            continue
+        if prev_role == "user" and role == "user":
+            bad.append((prev_idx + 1, i + 1))
+        prev_role = role
+        prev_idx = i
+    if not bad:
+        return []
+    return [{"kind": "alternation_violation", "severity": "critical",
+            "summary": f"{len(bad)} place(s) where two user turns appear with no assistant between",
+            "lines": sorted({line for pair in bad for line in pair})}]
+
+
+def detect_oversized_message(records):
+    bad = [(i + 1, record_size(r)) for i, r in enumerate(records)
+            if not r.deleted and record_size(r) > LARGE_MESSAGE_BYTES]
+    if not bad:
+        return []
+    biggest = max(b[1] for b in bad)
+    return [{"kind": "oversized_message", "severity": "warning",
+            "summary": (f"{len(bad)} message(s) larger than {LARGE_MESSAGE_BYTES//1024} KB "
+                        f"(biggest: {biggest//1024} KB) -- context bombs"),
+            "lines": [b[0] for b in bad]}]
+
+
+def detect_empty_tool_result(records):
+    bad = []
+    for i, r in enumerate(records):
+        if not is_user(r) or r.deleted:
+            continue
+        for b in content_of(r):
+            if isinstance(b, dict) and b.get("type") == "tool_result":
+                c = b.get("content")
+                if c is None or c == "" or c == []:
+                    bad.append(i + 1)
+                    break
+    if not bad:
+        return []
+    return [{"kind": "empty_tool_result", "severity": "warning",
+            "summary": f"{len(bad)} tool_result(s) with empty content",
+            "lines": bad}]
+
+
+def detect_duplicate_consecutive(records):
+    bad = []
+    prev_hash = None
+    prev_idx = None
+    for i, r in enumerate(records):
+        if r.deleted or not is_assistant(r):
+            continue
+        text = assistant_text(r)
+        if len(text) < DUPLICATE_MIN_TEXT_LEN:
+            prev_hash = None
+            continue
+        h = hashlib.md5(text.encode()).hexdigest()
+        if h == prev_hash:
+            bad.append(i + 1)
+        prev_hash = h
+        prev_idx = i
+    if not bad:
+        return []
+    return [{"kind": "duplicate_consecutive", "severity": "warning",
+            "summary": f"{len(bad)} consecutive duplicate assistant message(s)",
+            "lines": bad}]
+
+
+def detect_misordered_timestamps(records):
+    prev_ts = None
+    bad = []
+    for i, r in enumerate(records):
+        if r.deleted:
+            continue
+        ts = record_timestamp(r)
+        if ts is None:
+            continue
+        if prev_ts is not None and ts < prev_ts:
+            bad.append(i + 1)
+        prev_ts = ts
+    if not bad:
+        return []
+    return [{"kind": "misordered_timestamps", "severity": "info",
+            "summary": f"{len(bad)} record(s) with timestamps earlier than the previous",
+            "lines": bad}]
+
+
+DETECTORS = [
+    detect_invalid_json,
+    detect_interleaved_thinking,
+    detect_tool_pairing,
+    detect_alternation_violation,
+    detect_empty_assistant,
+    detect_trailing_noise,
+    detect_oversized_message,
+    detect_empty_tool_result,
+    detect_duplicate_consecutive,
+    detect_misordered_timestamps,
+    detect_large_session,
+]
+
+
+def diagnose(records):
+    issues = []
+    for d in DETECTORS:
+        issues.extend(d(records))
+    issues.sort(key=lambda x: SEV_ORDER[x["severity"]])
+    return issues
+
+
+# ---------------------------------------------------------------------------
+# Fixers. Return a structured report:
+#   {"removed": n, "added": n, "modified": n, "summary": str}
+# ---------------------------------------------------------------------------
+def _report(removed=0, added=0, modified=0, summary=""):
+    return {"removed": removed, "added": added, "modified": modified, "summary": summary}
+
+
+def fix_invalid_json(records):
+    n = 0
+    for r in records:
+        if r.obj is None and not r.deleted:
+            r.deleted = True
+            n += 1
+    return _report(removed=n, summary=f"removed {n} invalid/blank line(s)")
+
+
+def fix_interleaved_thinking(records):
+    n = 0
+    nrec = len(records)
+    i = 0
+    while i < nrec:
+        if records[i].deleted or not is_assistant(records[i]):
+            i += 1
+            continue
+        j = i
+        run = []
+        while j < nrec and (records[j].deleted or is_assistant(records[j])):
+            if not records[j].deleted:
+                run.append(j)
+            j += 1
+        ids = {msg_id(records[k]) for k in run}
+        if len(ids) > 1 and any(has_thinking(records[k]) for k in run):
+            for k in run:
+                if is_thinking_only(records[k]):
+                    records[k].deleted = True
+                    n += 1
+        i = j
+    return _report(removed=n, summary=f"removed {n} interleaved thinking-only line(s)")
+
+
+def fix_empty_assistant(records):
+    n = 0
+    for r in records:
+        if not r.deleted and is_assistant(r) and len(content_of(r)) == 0:
+            r.deleted = True
+            n += 1
+    return _report(removed=n, summary=f"removed {n} empty assistant message(s)")
+
+
+def fix_trailing_noise(records):
+    n = 0
+    live = [i for i, r in enumerate(records) if not r.deleted]
+    for i in reversed(live):
+        r = records[i]
+        t = rtype(r)
+        if t in ("user", "assistant") and not is_api_error(r):
+            break
+        r.deleted = True
+        n += 1
+    return _report(removed=n, summary=f"trimmed {n} trailing noise line(s)")
+
+
+def fix_nuke_thinking(records):
+    n_blocks = 0
+    n_emptied = 0
+    n_modified = 0
+    for r in records:
+        if r.deleted or not is_assistant(r):
+            continue
+        o = r.out_obj()
+        if not isinstance(o, dict):
+            continue
+        content = content_of(r)
+        kept = [b for b in content
+                if not (isinstance(b, dict) and b.get("type") in THINKING_TYPES)]
+        if len(kept) == len(content):
+            continue
+        n_blocks += len(content) - len(kept)
+        new_o = copy.deepcopy(o)
+        new_o.setdefault("message", {})["content"] = kept
+        r.new_obj = new_o
+        if not kept:
+            r.deleted = True
+            n_emptied += 1
+        else:
+            n_modified += 1
+    return _report(removed=n_emptied, modified=n_modified,
+            summary=f"stripped {n_blocks} thinking block(s); "
+                    f"dropped {n_emptied} now-empty message(s)")
+
+
+def fix_tool_pairing(records):
+    uses = _tool_use_ids(records)
+    results = _tool_result_ids(records)
+    orphan_uses = [(uid, idx) for uid, idx in uses.items() if uid not in results]
+    orphan_result_ids = {rid for rid in results if rid not in uses and rid is not None}
+
+    n_removed = 0
+    n_modified = 0
+    for r in records:
+        if r.deleted or not is_user(r):
+            continue
+        content = content_of(r)
+        kept = []
+        changed = False
+        for b in content:
+            if (isinstance(b, dict) and b.get("type") == "tool_result"
+                    and b.get("tool_use_id") in orphan_result_ids):
+                changed = True
+                n_removed += 1
+                continue
+            kept.append(b)
+        if changed:
+            new_o = copy.deepcopy(r.out_obj())
+            new_o.setdefault("message", {})["content"] = kept
+            r.new_obj = new_o
+            if not kept:
+                r.deleted = True
+            else:
+                n_modified += 1
+
+    new_records = []
+    insert_after = {idx: uid for uid, idx in orphan_uses}
+    n_added = 0
+    for i, r in enumerate(records):
+        new_records.append(r)
+        if i in insert_after:
+            uid = insert_after[i]
+            synth = {
+                "type": "user",
+                "message": {"role": "user", "content": [{
+                    "type": "tool_result", "tool_use_id": uid,
+                    "content": "[session repaired: original tool result was lost]",
+                    "is_error": True,
+                }]},
+            }
+            new_records.append(Record(json.dumps(synth, ensure_ascii=False), synth))
+            n_added += 1
+    records[:] = new_records
+    return _report(removed=n_removed, added=n_added, modified=n_modified,
+            summary=f"added {n_added} synthetic tool_result(s); "
+                    f"removed {n_removed} orphan result block(s)")
+
+
+def fix_alternation_violation(records):
+    """Insert a synthetic assistant turn between two consecutive user records."""
+    new_records = []
+    n_added = 0
+    prev_role = None
+    counter = 0
+    for r in records:
+        role = rtype(r) if not r.deleted else None
+        if role == "user" and prev_role == "user":
+            counter += 1
+            synth = {
+                "type": "assistant",
+                "message": {
+                    "id": f"synth_alt_{counter}", "role": "assistant",
+                    "content": [{"type": "text",
+                            "text": "[session repaired: missing assistant turn]"}],
+                },
+            }
+            new_records.append(Record(json.dumps(synth, ensure_ascii=False), synth))
+            n_added += 1
+        new_records.append(r)
+        if role in ("user", "assistant"):
+            prev_role = role
+    records[:] = new_records
+    return _report(added=n_added,
+            summary=f"inserted {n_added} synthetic assistant turn(s)")
+
+
+def fix_duplicate_consecutive(records):
+    n = 0
+    prev_hash = None
+    for r in records:
+        if r.deleted or not is_assistant(r):
+            continue
+        text = assistant_text(r)
+        if len(text) < DUPLICATE_MIN_TEXT_LEN:
+            prev_hash = None
+            continue
+        h = hashlib.md5(text.encode()).hexdigest()
+        if h == prev_hash:
+            r.deleted = True
+            n += 1
+        else:
+            prev_hash = h
+    return _report(removed=n, summary=f"removed {n} duplicate assistant message(s)")
+
+
+# kind -> (label, fixer)
+FIXES = {
+    "invalid_json":          ("Remove invalid/blank JSON lines",      fix_invalid_json),
+    "interleaved_thinking":  ("Remove interleaved thinking blocks (targeted)", fix_interleaved_thinking),
+    "orphan_tool_use":       ("Pair tool_use/tool_result (insert + clean)", fix_tool_pairing),
+    "orphan_tool_result":    ("Pair tool_use/tool_result (insert + clean)", fix_tool_pairing),
+    "alternation_violation": ("Repair user/assistant alternation", fix_alternation_violation),
+    "empty_assistant":       ("Remove empty assistant messages",    fix_empty_assistant),
+    "trailing_noise":        ("Trim trailing API-error / noise",    fix_trailing_noise),
+    "duplicate_consecutive": ("Remove duplicate consecutive messages", fix_duplicate_consecutive),
+}
+NUKE = ("Strip ALL thinking blocks (nuclear, most reliable)", fix_nuke_thinking)
+# Advisory-only kinds (no automatic fix):
+ADVISORY_KINDS = {"oversized_message", "empty_tool_result",
+                  "misordered_timestamps", "large_session"}
+
+
+# ---------------------------------------------------------------------------
+# Recommendation engine
+# ---------------------------------------------------------------------------
+def recommend(issues):
+    """Return (level, label, message)."""
+    if not issues:
+        return ("clean", "OK", "Session looks healthy. No repair needed.")
+
+    kinds = {i["kind"] for i in issues}
+    severities = {i["severity"] for i in issues}
+    has_critical = "critical" in severities
+    has_warning = "warning" in severities
+    has_interleaved = "interleaved_thinking" in kinds
+
+    if not has_critical and not has_warning:
+        return ("info", "ADVISE",
+                "Only informational issues. No repair needed -- consider "
+                "/compact if the session is large.")
+
+    if has_interleaved and has_critical:
+        return ("warn", "FIX",
+                "Thinking-block corruption detected. Recommended: `a` (safe fixes). "
+                "If the same API error persists after, use `n` (nuke).")
+
+    if has_critical and not has_interleaved:
+        return ("warn", "FIX",
+                "Critical structural issues, but NO thinking-block corruption. "
+                "Recommended: `a` (safe fixes only). Nuke is NOT advised here -- "
+                "it would strip thinking from every message without addressing "
+                "the actual problems.")
+
+    return ("info", "TIDY",
+            "Only minor issues. Recommended: `a` for hygiene. Nuke not needed.")
+
+
+def print_recommendation(rec):
+    level, label, msg = rec
+    color = {"clean": green, "info": blue, "warn": yellow}[level]
+    bar = "─" * 64
+    print(color("┌" + bar))
+    print(color("│ ") + bold(f"RECOMMENDATION: {label}"))
+    for line in textwrap.wrap(msg, 62):
+        print(color("│ ") + line)
+    print(color("└" + bar))
+
+
+# ---------------------------------------------------------------------------
+# Session discovery
+# ---------------------------------------------------------------------------
+def discover_sessions(base_dir):
+    out = []
+    for path in glob.glob(os.path.join(base_dir, "*", "*.jsonl")):
+        sid = os.path.splitext(os.path.basename(path))[0]
+        project = os.path.basename(os.path.dirname(path))
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            mtime = 0
+        out.append({"id": sid, "path": path, "project": project, "mtime": mtime})
+    out.sort(key=lambda s: s["mtime"], reverse=True)
+    return out
+
+
+def find_session(base_dir, sid):
+    hits = glob.glob(os.path.join(base_dir, "*", f"{sid}.jsonl"))
+    return hits[0] if hits else None
+
+
+_BACKUP_RE = __import__("re").compile(r"\.(\d+)(?:-(\d+))?\.backup$")
+
+
+def list_backups(path):
+    """Return sorted (newest first) list of backup paths for a session file.
+    Sort uses the timestamp embedded in the filename rather than mtime, since
+    shutil.copy2 preserves the source's mtime."""
+    bks = glob.glob(f"{path}.*.backup")
+    def _key(p):
+        m = _BACKUP_RE.search(p)
+        if not m:
+            return (0, 0)
+        return (int(m.group(1)), int(m.group(2) or 0))
+    bks.sort(key=_key, reverse=True)
+    return bks
+
+
+def backup(path):
+    """Create a timestamped backup. Collision-safe: if a backup with the same
+    second-precision timestamp already exists, append a counter suffix."""
+    ts = int(time.time())
+    dst = f"{path}.{ts}.backup"
+    n = 1
+    while os.path.exists(dst):
+        dst = f"{path}.{ts}-{n}.backup"
+        n += 1
+    shutil.copy2(path, dst)
+    return dst
+
+
+# ---------------------------------------------------------------------------
+# Preview / apply orchestration
+# ---------------------------------------------------------------------------
+def apply_fixes(records, fixers):
+    """Apply a list of (label, fn) fixers, deduplicating by fn identity."""
+    reports = []
+    applied = []
+    for label, fn in fixers:
+        if fn in applied:
+            continue
+        applied.append(fn)
+        rep = fn(records)
+        rep["label"] = label
+        reports.append(rep)
+    return reports
+
+
+def preview_fixes(records, fixers):
+    """Run fixes on a deep copy; return reports without touching records."""
+    rcopy = deep_copy_records(records)
+    return apply_fixes(rcopy, fixers)
+
+
+def format_totals(reports):
+    t = {"removed": 0, "added": 0, "modified": 0}
+    for r in reports:
+        for k in t:
+            t[k] += r.get(k, 0)
+    bits = []
+    if t["removed"]: bits.append(f"remove {t['removed']} line(s)")
+    if t["added"]:   bits.append(f"add {t['added']} synthetic line(s)")
+    if t["modified"]:bits.append(f"modify {t['modified']} message(s)")
+    return ", ".join(bits) if bits else "no changes"
+
+
+# ---------------------------------------------------------------------------
+# Display helpers
+# ---------------------------------------------------------------------------
+def severity_tally(issues):
+    t = {"critical": 0, "warning": 0, "info": 0}
+    for i in issues:
+        t[i["severity"]] += 1
+    bits = []
+    if t["critical"]: bits.append(red(f"{t['critical']} critical"))
+    if t["warning"]:  bits.append(yellow(f"{t['warning']} warning"))
+    if t["info"]:     bits.append(blue(f"{t['info']} info"))
+    return ", ".join(bits) if bits else green("clean")
+
+
+def print_session_list(sessions):
+    print(bold("\nSessions found:\n"))
+    for n, s in enumerate(sessions, 1):
+        recs = load_records(s["path"])
+        issues = diagnose(recs)
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(s["mtime"]))
+        print(f"  {bold(str(n).rjust(2))}. {s['id'][:8]}…  "
+              f"{dim(when)}  {dim(s['project'][:28])}")
+        print(f"       {severity_tally(issues)}")
+    print()
+
+
+def print_diagnosis(path, issues):
+    print(bold(f"\nDiagnosis: {os.path.basename(path)}"))
+    print(dim(path))
+    if not issues:
+        print(green("\n  No issues detected. This session looks healthy.\n"))
+        return
+    print()
+    for iss in issues:
+        lines = iss["lines"]
+        loc = ""
+        if lines:
+            show = ", ".join(map(str, lines[:6]))
+            if len(lines) > 6:
+                show += f", +{len(lines) - 6} more"
+            loc = dim(f"  [lines {show}]")
+        print(f"  {SEV_LABEL[iss['severity']]}  {iss['summary']}{loc}")
+    print()
+
+
+# ---------------------------------------------------------------------------
+# Interactive flow
+# ---------------------------------------------------------------------------
+def interactive_session(path, dry_run=False):
+    while True:
+        records = load_records(path)
+        issues = diagnose(records)
+        print_diagnosis(path, issues)
+        print_recommendation(recommend(issues))
+
+        menu = []
+        seen_labels = set()
+        for iss in issues:
+            f = FIXES.get(iss["kind"])
+            if f and f[0] not in seen_labels:
+                menu.append(f)
+                seen_labels.add(f[0])
+        menu.append(NUKE)
+
+        print(bold("\nAvailable fixes:"))
+        for n, (label, _) in enumerate(menu, 1):
+            print(f"  {bold(str(n))}. {label}")
+        print(dim("\n  a = all safe fixes (everything except nuke)"))
+        print(dim("  n = nuke (strip all thinking blocks) -- always available"))
+        print(dim("  numbers (comma-separated) = apply those fixes"))
+        print(dim("  b = back to session list   q = quit"))
+        if dry_run:
+            print(yellow("  [DRY-RUN: no changes will be written]"))
+        choice = input(bold("\nWhat would you like to fix? ")).strip().lower()
+
+        if choice in ("q", "quit"):
+            sys.exit(EXIT_OK)
+        if choice in ("b", "back", ""):
+            return
+
+        chosen = []
+        if choice in ("a", "all"):
+            chosen = [m for m in menu if m is not NUKE]
+        elif choice in ("n", "nuke"):
+            chosen = [NUKE]
+        else:
+            try:
+                picks = [int(x) for x in choice.replace(" ", "").split(",") if x]
+            except ValueError:
+                print(red("  Didn't understand that. Try again."))
+                continue
+            for p in picks:
+                if 1 <= p <= len(menu):
+                    chosen.append(menu[p - 1])
+                else:
+                    print(red(f"  No option {p}."))
+        if not chosen:
+            continue
+
+        # Preview using a deep copy
+        preview_reports = preview_fixes(records, chosen)
+        print(bold("\nPreview:"))
+        for rep in preview_reports:
+            print(f"  • {rep['label']}: {dim(rep['summary'])}")
+        print(bold(f"  Net change: {format_totals(preview_reports)}"))
+
+        if any(m is NUKE for m in chosen):
+            print(yellow("  Note: nuke removes ALL reasoning traces "
+                  "(text & tools kept)."))
+
+        if dry_run:
+            print(yellow("\n  DRY-RUN: not writing. Run again without "
+                  "--dry-run to apply."))
+            return
+
+        if input(bold("Proceed? [y/N] ")).strip().lower() not in ("y", "yes"):
+            print(dim("  Cancelled."))
+            continue
+
+        bpath = backup(path)
+        print(green(f"  Backup: {bpath}"))
+        reports = apply_fixes(records, chosen)
+        for rep in reports:
+            print(f"  {green('✓')} {rep['label']}: {dim(rep['summary'])}")
+        write_records(path, records)
+        print(green("\n  Written. Re-diagnosing…"))
+
+
+def interactive_picker(base_dir, dry_run=False):
+    while True:
+        sessions = discover_sessions(base_dir)
+        if not sessions:
+            print(yellow(f"\nNo .jsonl sessions found under {base_dir}"))
+            return
+        print_session_list(sessions)
+        choice = input(bold("Pick a session number (q to quit): ")).strip().lower()
+        if choice in ("q", "quit", ""):
+            return
+        try:
+            n = int(choice)
+            assert 1 <= n <= len(sessions)
+        except (ValueError, AssertionError):
+            print(red("  Invalid choice."))
+            continue
+        interactive_session(sessions[n - 1]["path"], dry_run=dry_run)
+
+
+# ---------------------------------------------------------------------------
+# Non-interactive commands
+# ---------------------------------------------------------------------------
+def cmd_list(base_dir):
+    sessions = discover_sessions(base_dir)
+    if not sessions:
+        print(yellow(f"\nNo .jsonl sessions found under {base_dir}"))
+        return EXIT_OK
+    print_session_list(sessions)
+    any_issues = False
+    for s in sessions:
+        if diagnose(load_records(s["path"])):
+            any_issues = True
+            break
+    return EXIT_ISSUES_FOUND if any_issues else EXIT_OK
+
+
+def cmd_json(base_dir, session_id):
+    """Machine-readable diagnosis."""
+    if session_id:
+        path = find_session(base_dir, session_id)
+        if not path:
+            json.dump({"error": f"no session {session_id} under {base_dir}"}, sys.stdout)
+            sys.stdout.write("\n")
+            return EXIT_INPUT_ERROR
+        targets = [{"id": session_id, "path": path,
+                "project": os.path.basename(os.path.dirname(path)),
+                "mtime": os.path.getmtime(path)}]
+    else:
+        targets = discover_sessions(base_dir)
+
+    out = {"sessions": []}
+    any_critical = False
+    for s in targets:
+        recs = load_records(s["path"])
+        issues = diagnose(recs)
+        rec = recommend(issues)
+        out["sessions"].append({
+            "id": s["id"],
+            "path": s["path"],
+            "project": s["project"],
+            "mtime": s["mtime"],
+            "line_count": sum(1 for r in recs if not r.deleted),
+            "issues": issues,
+            "recommendation": {"level": rec[0], "label": rec[1], "message": rec[2]},
+        })
+        if any(i["severity"] == "critical" for i in issues):
+            any_critical = True
+    json.dump(out, sys.stdout, indent=2)
+    sys.stdout.write("\n")
+    return EXIT_ISSUES_FOUND if any_critical else EXIT_OK
+
+
+def cmd_fix_all(base_dir, session_id, dry_run=False, json_out=False):
+    """Non-interactive: apply every safe fix (no nuke), back up, report."""
+    path = find_session(base_dir, session_id)
+    if not path:
+        msg = f"no session {session_id} under {base_dir}"
+        if json_out:
+            json.dump({"error": msg}, sys.stdout); sys.stdout.write("\n")
+        else:
+            print(red(msg))
+        return EXIT_INPUT_ERROR
+
+    records = load_records(path)
+    before = diagnose(records)
+    fixers = []
+    seen = set()
+    for iss in before:
+        f = FIXES.get(iss["kind"])
+        if f and id(f[1]) not in seen:
+            fixers.append(f)
+            seen.add(id(f[1]))
+
+    if not fixers:
+        if json_out:
+            json.dump({"session": session_id, "applied": [], "remaining": before,
+                    "dry_run": dry_run, "wrote": False,
+                    "exit_code": EXIT_OK}, sys.stdout)
+            sys.stdout.write("\n")
+        else:
+            print(green(f"\nNothing to fix in {session_id}."))
+            print_diagnosis(path, before)
+        return EXIT_OK
+
+    if dry_run:
+        reports = preview_fixes(records, fixers)
+        if json_out:
+            json.dump({"session": session_id, "applied": reports,
+                    "wrote": False, "dry_run": True,
+                    "exit_code": EXIT_OK}, sys.stdout)
+            sys.stdout.write("\n")
+        else:
+            print(bold(f"\nDRY-RUN for {session_id}"))
+            for rep in reports:
+                print(f"  • {rep['label']}: {dim(rep['summary'])}")
+            print(bold(f"  Net change: {format_totals(reports)}"))
+            print(yellow("\n  (not writing)"))
+        return EXIT_OK
+
+    bpath = backup(path)
+    reports = apply_fixes(records, fixers)
+    write_records(path, records)
+    after = diagnose(load_records(path))
+    after_critical = any(i["severity"] == "critical" for i in after)
+    exit_code = EXIT_ISSUES_REMAIN if after_critical else EXIT_OK
+    if json_out:
+        json.dump({"session": session_id, "applied": reports,
+                "remaining": after, "backup": bpath, "wrote": True,
+                "dry_run": False, "exit_code": exit_code}, sys.stdout)
+        sys.stdout.write("\n")
+    else:
+        print(green(f"\nBackup: {bpath}"))
+        for rep in reports:
+            print(f"  {green('✓')} {rep['label']}: {dim(rep['summary'])}")
+        print()
+        print_diagnosis(path, after)
+    return exit_code
+
+
+def cmd_restore(base_dir, session_id, dry_run=False):
+    path = find_session(base_dir, session_id)
+    if not path:
+        print(red(f"no session {session_id} under {base_dir}"))
+        return EXIT_INPUT_ERROR
+    bks = list_backups(path)
+    if not bks:
+        print(red(f"no backups found for {session_id}"))
+        print(dim(f"  (looked for: {path}.*.backup)"))
+        return EXIT_INPUT_ERROR
+    newest = bks[0]
+    when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(os.path.getmtime(newest)))
+    print(bold(f"\nRestore plan"))
+    print(f"  Session: {session_id}")
+    print(f"  Backup:  {newest}")
+    print(f"  Made at: {when}")
+    if len(bks) > 1:
+        print(dim(f"  ({len(bks)} backups available; this is the most recent)"))
+    if dry_run:
+        print(yellow("\n  DRY-RUN: not writing."))
+        return EXIT_OK
+    if input(bold("\nProceed? [y/N] ")).strip().lower() not in ("y", "yes"):
+        print(dim("  Cancelled."))
+        return EXIT_OK
+    # Make a safety backup of the CURRENT (broken) state before overwriting,
+    # so a restore is itself reversible.
+    safety = backup(path)
+    shutil.copy2(newest, path)
+    print(green(f"  Restored. Pre-restore state saved to: {safety}"))
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+def main():
+    ap = argparse.ArgumentParser(
+        add_help=True, description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("session", nargs="?", help="session id (UUID)")
+    ap.add_argument("--dir", default=DEFAULT_DIR,
+            help=f"projects dir (default {DEFAULT_DIR})")
+    ap.add_argument("--list", action="store_true",
+            help="list sessions with issue counts and exit")
+    ap.add_argument("--json", action="store_true",
+            help="machine-readable JSON diagnosis to stdout")
+    ap.add_argument("--fix-all", action="store_true",
+            help="non-interactive: apply every safe fix (no nuke) to SESSION")
+    ap.add_argument("--restore", action="store_true",
+            help="restore SESSION from its most recent backup")
+    ap.add_argument("--dry-run", action="store_true",
+            help="preview the effect of any operation without writing")
+    args = ap.parse_args()
+
+    base = os.path.expanduser(args.dir)
+    if not os.path.isdir(base):
+        print(red(f"Projects dir not found: {base}"))
+        sys.exit(EXIT_INPUT_ERROR)
+
+    # Routing
+    if args.restore:
+        if not args.session:
+            print(red("--restore requires a SESSION_ID"))
+            sys.exit(EXIT_INPUT_ERROR)
+        sys.exit(cmd_restore(base, args.session, dry_run=args.dry_run))
+
+    if args.fix_all:
+        if not args.session:
+            print(red("--fix-all requires a SESSION_ID"))
+            sys.exit(EXIT_INPUT_ERROR)
+        sys.exit(cmd_fix_all(base, args.session,
+                dry_run=args.dry_run, json_out=args.json))
+
+    if args.json:
+        sys.exit(cmd_json(base, args.session))
+
+    if args.list:
+        sys.exit(cmd_list(base))
+
+    # Interactive
+    print(bold("\nclaude-session-doctor v1.1"))
+    print(dim("Diagnose & repair Claude Code session history. "
+              "Backups are automatic."))
+    if args.dry_run:
+        print(yellow("DRY-RUN mode: no writes."))
+
+    if args.session:
+        path = find_session(base, args.session)
+        if not path:
+            print(red(f"\nNo session file for id '{args.session}' under {base}"))
+            sys.exit(EXIT_INPUT_ERROR)
+        interactive_session(path, dry_run=args.dry_run)
+    else:
+        interactive_picker(base, dry_run=args.dry_run)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print(dim("\nInterrupted."))
+        sys.exit(130)

@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "claude-session-doctor"
+version = "1.1.0"
+description = "Diagnose and repair corrupted Claude Code session files. Recover bricked sessions instead of starting over."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.8"
+authors = [{ name = "Prem Thavare" }]
+keywords = [
+    "claude",
+    "claude-code",
+    "cli",
+    "recovery",
+    "repair",
+    "session",
+    "jsonl",
+    "debugging",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Software Development :: Debuggers",
+    "Topic :: System :: Recovery Tools",
+    "Topic :: Utilities",
+]
+
+# No runtime dependencies — Python standard library only.
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/YOUR_USERNAME/claude-session-doctor"
+Repository = "https://github.com/YOUR_USERNAME/claude-session-doctor"
+Issues = "https://github.com/YOUR_USERNAME/claude-session-doctor/issues"
+Changelog = "https://github.com/YOUR_USERNAME/claude-session-doctor/blob/main/CHANGELOG.md"
+
+# Ship the single-file CLI as-is. We deliberately use `script-files` rather
+# than `[project.scripts]` because the tool is a self-contained executable
+# script, not an importable Python module — and that single-file design is
+# a core feature (people in trouble can curl one file and run it).
+[tool.setuptools]
+py-modules = []
+script-files = ["claude-session-doctor"]
