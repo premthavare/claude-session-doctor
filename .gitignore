@@ -39,6 +39,8 @@ Thumbs.db
 *.tmp
 fake/
 
-# Demo: demo.txt is regenerated locally by demo/generate.py for inspection;
-# the canonical artefact is demo.cast, so demo.txt doesn't need to be tracked.
+# Demo: demo.gif is the committed, README-embedded artefact. demo.cast and
+# demo.txt are intermediates regenerated locally by demo/generate.py, so they
+# don't need to be tracked.
+demo/demo.cast
 demo/demo.txt

@@ -3,10 +3,14 @@
 Demo generator for claude-session-doctor.
 
 Sets up a synthetic broken session, runs the tool through its main flows,
-and writes three artefacts:
+and writes two artefacts:
 
-    demo/demo.cast       asciinema v2 cast file (colour, replayable)
-    demo/demo.txt        plain-text capture (for paste into the README)
+    demo/demo.cast       recording of the run (convert to demo.gif with `agg`)
+    demo/demo.txt        plain-text capture (for local inspection)
+
+Convert the cast to the GIF the README embeds:
+
+    agg demo/demo.cast demo/demo.gif
 
 Re-run after any UX change so the demo stays in sync with the tool:
 

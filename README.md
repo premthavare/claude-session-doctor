@@ -45,19 +45,7 @@ A typical recovery: pick the broken session → read the recommendation → pres
 
 ![claude-session-doctor demo](demo/demo.gif)
 
-A walkthrough of every major feature — diagnosis, the recommendation engine, dry-run preview, `--fix-all`, `--json`, and `--restore`. Prefer an interactive, copy-pasteable version? Watch it on [asciinema](https://asciinema.org/a/1lSm1d45Q16lO3H7), or play locally with:
-
-```bash
-asciinema play demo/demo.cast
-```
-
-Prefer to watch it run live? The script below sets up a throwaway broken session, walks the tool through the same six scenarios, and cleans up after itself:
-
-```bash
-demo/demo.sh
-```
-
-See [`demo/README.md`](demo/README.md) for details on regenerating the cast and recording your own.
+A walkthrough of every major feature — diagnosis, the recommendation engine, dry-run preview, `--fix-all`, `--json`, and `--restore`. The clip is generated from real tool output by [`demo/generate.py`](demo/generate.py); see [`demo/README.md`](demo/README.md) to regenerate it.
 
 ## What it detects and fixes
 
