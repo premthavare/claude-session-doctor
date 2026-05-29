@@ -43,14 +43,15 @@ A typical recovery: pick the broken session → read the recommendation → pres
 
 ## Demo
 
-A pre-recorded asciinema walkthrough of every major feature lives in [`demo/demo.cast`](demo/demo.cast). Play it locally with:
+[![asciicast](https://asciinema.org/a/1lSm1d45Q16lO3H7.svg)](https://asciinema.org/a/1lSm1d45Q16lO3H7)
+
+A walkthrough of every major feature — diagnosis, the recommendation engine, dry-run preview, `--fix-all`, `--json`, and `--restore`. Click the badge above for the full interactive player on asciinema.org, or play locally with:
 
 ```bash
-pipx install asciinema   # one-time
 asciinema play demo/demo.cast
 ```
 
-Or run the live demo yourself (sets up a throwaway broken session and walks the tool through six scenarios; cleans up after):
+Prefer to watch it run live? The script below sets up a throwaway broken session, walks the tool through the same six scenarios, and cleans up after itself:
 
 ```bash
 demo/demo.sh

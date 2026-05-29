@@ -63,6 +63,31 @@ Run the full suite before opening a PR:
 python3 -m unittest discover -s tests -v
 ```
 
+### Real-world fixtures
+
+Synthetic JSONL encodes our *assumptions* about how corruption looks. A fixture
+that reproduces an actual break in the real Claude Code schema is stronger — it
+catches detectors that pass on toy input but trip on the extra fields real
+records carry. `tests/fixtures/bricked_session.jsonl` is the reference example,
+exercised end-to-end by `TestRealWorldFixture`.
+
+If you add a fixture, **scrub it first** — a session file is a transcript of
+real work:
+
+- Replace message text, `thinking` content, and tool inputs/outputs with
+  innocuous placeholders. The bug is in the *structure* (block ordering, message
+  IDs, signatures, pairing), so the content can be anything.
+- Replace `cwd`, `gitBranch`, `sessionId`, `uuid`/`parentUuid`, and any real
+  paths with fake values. The fixture above uses `/Users/dev/myproject` and the
+  README's example session ID.
+- `signature` blobs can be obviously-fake strings; nothing validates them.
+- Keep it minimal — a handful of records is enough to reproduce a pattern.
+
+A good way to build one: inspect a real session's *key structure only* (field
+names, block types — never values) to get the schema right, then hand-write a
+small fixture from scratch. Don't copy real lines and edit them down; it's too
+easy to miss a payload.
+
 ## Filing issues
 
 The most useful issue includes:
