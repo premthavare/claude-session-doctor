@@ -7,6 +7,7 @@ a regular import.
 import importlib.util
 import json
 import os
+import shutil
 import tempfile
 import time
 import unittest
@@ -14,6 +15,7 @@ from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().parent.parent / "claude-session-doctor"
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
 _spec = importlib.util.spec_from_loader("csd", SourceFileLoader("csd", str(SCRIPT)))
 csd = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(csd)
@@ -480,7 +482,7 @@ class TestRestoreAndCommands(unittest.TestCase):
 
     def test_cmd_restore_overwrites_with_most_recent_backup(self):
         base, sid, path = self._make_project([_user("original content")])
-        bk = csd.backup(path)
+        csd.backup(path)
         # corrupt the live file
         with open(path, "w") as f:
             f.write("CORRUPTED\n")
@@ -539,6 +541,88 @@ class TestRestoreAndCommands(unittest.TestCase):
         issues = csd.diagnose(csd.load_records(path))
         criticals = [i for i in issues if i["severity"] == "critical"]
         self.assertEqual(criticals, [])
+
+
+# ---------------------------------------------------------------------------
+# Real-world fixture
+#
+# The tests above build minimal synthetic JSONL, which encodes our *assumptions*
+# about how corruption looks. This class runs against a checked-in fixture
+# (tests/fixtures/bricked_session.jsonl) that reproduces an actual bricked
+# session in the real Claude Code schema — full top-level fields (parentUuid /
+# uuid chain, sessionId, ISO-8601 timestamps, requestId, model, usage), a
+# complete well-formed assistant turn, an interleaved thinking-only intruder
+# line from a second signed response (the root of the 400 "thinking blocks
+# cannot be modified" error), an orphaned tool_use, and the trailing API-error
+# + system noise. It guards against detectors that pass on toy input but trip
+# on the extra fields and message shapes real sessions carry.
+# ---------------------------------------------------------------------------
+SESSION_ID = "abaca37e-792e-4168-94f7-0c6a6ef24aa7"
+
+
+class TestRealWorldFixture(unittest.TestCase):
+
+    def setUp(self):
+        self.fixture = FIXTURES / "bricked_session.jsonl"
+        self.assertTrue(self.fixture.exists(), "fixture file is missing")
+
+    def test_fixture_is_well_formed_jsonl(self):
+        with open(self.fixture) as f:
+            lines = [l for l in f if l.strip()]
+        self.assertGreater(len(lines), 0)
+        for l in lines:
+            json.loads(l)  # every line parses — the corruption is structural, not syntactic
+
+    def test_fixture_diagnoses_the_expected_real_corruption(self):
+        issues = csd.diagnose(csd.load_records(str(self.fixture)))
+        by_kind = {i["kind"]: i for i in issues}
+        # the three hallmarks of the bricked-session case
+        self.assertIn("interleaved_thinking", by_kind)
+        self.assertIn("orphan_tool_use", by_kind)
+        self.assertIn("trailing_noise", by_kind)
+        self.assertEqual(by_kind["interleaved_thinking"]["severity"], "critical")
+        self.assertEqual(by_kind["orphan_tool_use"]["severity"], "critical")
+        # the recommendation engine should steer to FIX, not nuke
+        _, label, _ = csd.recommend(issues)
+        self.assertEqual(label, "FIX")
+
+    def test_fixture_heals_clean_via_cmd_fix_all(self):
+        """End-to-end through the real command path: copy into a projects dir,
+        run --fix-all, assert it backs up, writes, and re-diagnoses clean."""
+        base = tempfile.mkdtemp()
+        proj = os.path.join(base, "myproject")
+        os.makedirs(proj)
+        live = os.path.join(proj, SESSION_ID + ".jsonl")
+        shutil.copy(str(self.fixture), live)
+
+        rc = csd.cmd_fix_all(base, SESSION_ID, dry_run=False, json_out=False)
+        self.assertEqual(rc, csd.EXIT_OK)  # no criticals remain -> exit 0
+
+        # a backup of the original (broken) state was created
+        self.assertTrue(csd.list_backups(live), "expected a backup before writing")
+
+        after = csd.diagnose(csd.load_records(live))
+        criticals = [i for i in after if i["severity"] == "critical"]
+        self.assertEqual(criticals, [], f"criticals remain: {criticals}")
+
+        flat = Path(live).read_text()
+        self.assertIn("6 times 7 is", flat)                 # host turn's text preserved
+        self.assertNotIn("reconsider whether the test", flat)  # intruder thinking removed
+        self.assertIn("session repaired", flat)             # orphan tool_use paired
+        self.assertNotIn("cannot be modified", flat)        # trailing API error trimmed
+
+    def test_fixture_dry_run_leaves_file_untouched(self):
+        base = tempfile.mkdtemp()
+        proj = os.path.join(base, "myproject")
+        os.makedirs(proj)
+        live = os.path.join(proj, SESSION_ID + ".jsonl")
+        shutil.copy(str(self.fixture), live)
+        before = Path(live).read_text()
+
+        rc = csd.cmd_fix_all(base, SESSION_ID, dry_run=True, json_out=False)
+        self.assertEqual(rc, csd.EXIT_OK)
+        self.assertEqual(Path(live).read_text(), before)  # nothing written
+        self.assertEqual(csd.list_backups(live), [])  # no backup on dry-run
 
 
 if __name__ == "__main__":
