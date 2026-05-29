@@ -16,7 +16,6 @@ import json
 import os
 import shutil
 import subprocess
-import sys
 import tempfile
 import time
 
@@ -47,6 +46,10 @@ class Cast:
         self.t += seconds
 
     def emit(self, text):
+        # asciinema player emulates a TTY; bare \n moves down without
+        # returning to col 0. Normalise any \n not already preceded by \r.
+        import re
+        text = re.sub(r"(?<!\r)\n", "\r\n", text)
         self.events.append([round(self.t, 3), "o", text])
 
     def typed(self, command, delay=TYPING_SPEED):
@@ -129,12 +132,18 @@ def main():
     cast = Cast()
     transcript = []
 
+    # The tool prints absolute session paths; `base` is a random tempdir that
+    # would otherwise bake a machine-specific path into the cast and churn the
+    # diff on every regen. Normalise it to a stable, generic placeholder.
+    def clean(output):
+        return output.replace(base, "/Users/you")
+
     def show(command, output, extra_pause=0.0):
+        output = clean(output)
         cast.run_visible(command, output, extra_pause=extra_pause)
         transcript.append((command, output))
 
     def banner(text):
-        bar = "─" * 60
         msg = f"\x1b[1;36m# {text}\x1b[0m\r\n"
         cast.prompt()
         cast.emit(msg)
@@ -144,7 +153,7 @@ def main():
     # ----- Scenario 1: triage with --list -----
     banner("triage all sessions at a glance")
     r = run([TOOL, "--dir", proj_dir, "--list"])
-    show(f"claude-session-doctor --list", r.stdout, extra_pause=SECTION_PAUSE)
+    show("claude-session-doctor --list", r.stdout, extra_pause=SECTION_PAUSE)
 
     # ----- Scenario 2: interactive diagnosis (just diagnosis + recommendation) -----
     banner("diagnose the broken session and read the recommendation")
