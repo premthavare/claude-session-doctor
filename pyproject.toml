@@ -43,10 +43,10 @@ classifiers = [
 dependencies = []
 
 [project.urls]
-Homepage = "https://github.com/YOUR_USERNAME/claude-session-doctor"
-Repository = "https://github.com/YOUR_USERNAME/claude-session-doctor"
-Issues = "https://github.com/YOUR_USERNAME/claude-session-doctor/issues"
-Changelog = "https://github.com/YOUR_USERNAME/claude-session-doctor/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/premthavare/claude-session-doctor"
+Repository = "https://github.com/premthavare/claude-session-doctor"
+Issues = "https://github.com/premthavare/claude-session-doctor/issues"
+Changelog = "https://github.com/premthavare/claude-session-doctor/blob/main/CHANGELOG.md"
 
 # Ship the single-file CLI as-is. We deliberately use `script-files` rather
 # than `[project.scripts]` because the tool is a self-contained executable

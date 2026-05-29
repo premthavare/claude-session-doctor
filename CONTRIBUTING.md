@@ -7,7 +7,7 @@ Thanks for considering a contribution. This is a small project, so the bar is mo
 No dependencies. Clone, run, test:
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/claude-session-doctor.git
+git clone https://github.com/premthavare/claude-session-doctor.git
 cd claude-session-doctor
 python3 -m unittest discover -s tests -v
 ```

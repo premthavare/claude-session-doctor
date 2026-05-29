@@ -43,9 +43,9 @@ A typical recovery: pick the broken session → read the recommendation → pres
 
 ## Demo
 
-[![asciicast](https://asciinema.org/a/1lSm1d45Q16lO3H7.svg)](https://asciinema.org/a/1lSm1d45Q16lO3H7)
+![claude-session-doctor demo](demo/demo.gif)
 
-A walkthrough of every major feature — diagnosis, the recommendation engine, dry-run preview, `--fix-all`, `--json`, and `--restore`. Click the badge above for the full interactive player on asciinema.org, or play locally with:
+A walkthrough of every major feature — diagnosis, the recommendation engine, dry-run preview, `--fix-all`, `--json`, and `--restore`. Prefer an interactive, copy-pasteable version? Watch it on [asciinema](https://asciinema.org/a/1lSm1d45Q16lO3H7), or play locally with:
 
 ```bash
 asciinema play demo/demo.cast
@@ -122,7 +122,7 @@ If the "net change" doesn't look right, answer `N` and nothing is written. The o
 If you have [pipx](https://pipx.pypa.io/) installed:
 
 ```bash
-pipx install git+https://github.com/YOUR_USERNAME/claude-session-doctor.git
+pipx install git+https://github.com/premthavare/claude-session-doctor.git
 claude-session-doctor --help
 ```
 
@@ -131,7 +131,7 @@ pipx puts the script onto your `PATH` in an isolated virtual environment, with n
 ### Option 2: Clone and run (no install)
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/claude-session-doctor.git
+git clone https://github.com/premthavare/claude-session-doctor.git
 cd claude-session-doctor
 chmod +x claude-session-doctor
 ./claude-session-doctor
@@ -140,7 +140,7 @@ chmod +x claude-session-doctor
 ### Option 3: Single-file download (when you just need it working)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/YOUR_USERNAME/claude-session-doctor/main/claude-session-doctor -o claude-session-doctor
+curl -fsSL https://raw.githubusercontent.com/premthavare/claude-session-doctor/main/claude-session-doctor -o claude-session-doctor
 chmod +x claude-session-doctor
 ./claude-session-doctor
 ```
